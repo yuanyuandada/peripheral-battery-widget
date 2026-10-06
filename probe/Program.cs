@@ -5,22 +5,17 @@ using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
 Console.OutputEncoding = Encoding.UTF8;
-Console.WriteLine("=== 0x12 帧电量解码验证 v5 ===");
-Console.WriteLine($"开始: {DateTime.Now:HH:mm:ss}  时长25秒");
+Console.WriteLine("=== 蓝牙手柄电量报文探测 v6 ===");
+Console.WriteLine($"开始: {DateTime.Now:HH:mm:ss}  被动听25秒+主动请求");
 Console.WriteLine();
 
 var hidClass = new Guid(0x4d1e55b2, 0xf16f, 0x11cf, 0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30);
 string[] paths = HidNative.GetDeviceInterfacePaths(hidClass);
-foreach (var p in paths)
-{
-    var m = Regex.Match(p, @"vid_3537&pid_([0-9a-f]{4})", RegexOptions.IgnoreCase);
-    if (!m.Success) continue;
-    string pid = m.Groups[1].Value.ToUpperInvariant();
-    HidNative.DecodeBattery(p, pid);
-}
+Console.WriteLine($"HID 接口总数: {paths.Length}");
+HidNative.ListAll(paths);
 
 Console.WriteLine();
-Console.WriteLine("=== 验证结束 ===");
+Console.WriteLine("=== 探测结束 ===");
 
 internal static class HidNative
 {
@@ -71,74 +66,95 @@ internal static class HidNative
     private const uint GENERIC_READ = 0x80000000, GENERIC_WRITE = 0x40000000, SHARE_RW = 3, OPEN_EXISTING = 3, FILE_FLAG_OVERLAPPED = 0x40000000;
     private const int HIDP_SUCCESS = 0x00110000;
 
-    public static void DecodeBattery(string path, string pid)
+    public static void ListAll(string[] paths)
+    {
+        foreach (var p in paths)
+        {
+            var h = CreateFileW(p, GENERIC_READ, SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+            if (h.IsInvalid) { Console.WriteLine($"  [skip] err={Marshal.GetLastWin32Error()} {p[^70..]}"); continue; }
+            using (h)
+            {
+                if (!HidD_GetPreparsedData(h, out var pp)) continue;
+                try
+                {
+                    var caps = new HIDP_CAPS();
+                    if (HidP_GetCaps(pp, ref caps) == HIDP_SUCCESS)
+                        Console.WriteLine($"  用法页=0x{caps.UsagePage:X4} 用法=0x{caps.Usage:X4} in={caps.InputReportByteLength}B out={caps.OutputReportByteLength}B feat={caps.FeatureReportByteLength}B  {p[^70..]}");
+                }
+                finally { HidD_FreePreparsedData(pp); }
+            }
+        }
+    }
+
+    public static void Capture(string path)
     {
         var h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
-        if (h.IsInvalid) { Console.WriteLine($"[PID_{pid}] 打开失败 err={Marshal.GetLastWin32Error()}"); return; }
+        if (h.IsInvalid) { Console.WriteLine($"  打开失败 err={Marshal.GetLastWin32Error()}"); return; }
         using (h)
         {
             if (!HidD_GetPreparsedData(h, out var pp)) return;
-            int inLen = 65, outLen = 65;
+            int inLen, outLen;
             try
             {
                 var caps = new HIDP_CAPS();
-                if (HidP_GetCaps(pp, ref caps) == HIDP_SUCCESS) { inLen = caps.InputReportByteLength; outLen = caps.OutputReportByteLength; }
+                int hr = HidP_GetCaps(pp, ref caps);
+                if (hr != HIDP_SUCCESS) { Console.WriteLine("  GetCaps失败"); return; }
+                inLen = caps.InputReportByteLength; outLen = caps.OutputReportByteLength;
+                Console.WriteLine($"  用法页=0x{caps.UsagePage:X4} 用法=0x{caps.Usage:X4} in={inLen}B out={outLen}B");
             }
             finally { HidD_FreePreparsedData(pp); }
-            if (outLen < 3) { Console.WriteLine($"[PID_{pid}] 非厂商通道(in={inLen} out={outLen})，跳过"); return; }
+            if (inLen < 4) { Console.WriteLine("  (输入太短，跳过)"); return; }
 
             var ev = CreateEventW(IntPtr.Zero, 0, 0, null);
             if (ev == IntPtr.Zero) return;
             try
             {
-                Console.WriteLine($"[PID_{pid}] 心跳+监听25秒 (in={inLen} out={outLen})…");
                 var stop = DateTime.Now.AddSeconds(25);
-                var hb = System.Threading.Tasks.Task.Run(() =>
+                var seen = new HashSet<string>();
+                int total = 0;
+
+                // 10秒后开始每3秒发一次 GIP 电量请求变体
+                var reqThread = System.Threading.Tasks.Task.Run(async () =>
                 {
-                    var ob = new byte[outLen];
-                    ob[0] = 0x0F; ob[1] = 0xF2; ob[2] = 0x00;   // getHeartBeatCommand(0)
-                    int fails = 0;
+                    await System.Threading.Tasks.Task.Delay(10_000);
+                    byte[][] reqs =
+                    {
+                        new byte[]{ 0x04, 0x02, 0x00, 0x05 },   // GIP battery request
+                        new byte[]{ 0x01, 0x03, 0x02 },          // GIP announce?
+                        new byte[]{ 0x04, 0x02, 0x00, 0x0F },
+                    };
                     while (DateTime.Now < stop)
                     {
-                        var ov = new System.Threading.NativeOverlapped { EventHandle = ev };
-                        if (!WriteFile(h, ob, (uint)ob.Length, out _, ref ov))
+                        foreach (var r in reqs)
                         {
-                            if (Marshal.GetLastWin32Error() == 997)
-                            { if (WaitForSingleObject(ev, 200) != 0) { CancelIoEx(h, IntPtr.Zero); WaitForSingleObject(ev, 100); fails++; } }
-                            else { if (fails++ < 2) Console.WriteLine($"[PID_{pid}] 心跳写失败 err={Marshal.GetLastWin32Error()}"); }
+                            if (outLen < r.Length) continue;
+                            var ob = new byte[outLen];
+                            Array.Copy(r, ob, r.Length);
+                            var ovw = new System.Threading.NativeOverlapped { EventHandle = ev };
+                            if (!WriteFile(h, ob, (uint)ob.Length, out _, ref ovw) && Marshal.GetLastWin32Error() == 997)
+                            { if (WaitForSingleObject(ev, 200) != 0) CancelIoEx(h, IntPtr.Zero); }
+                            await System.Threading.Tasks.Task.Delay(500);
                         }
-                        System.Threading.Thread.Sleep(900);
+                        await System.Threading.Tasks.Task.Delay(2000);
                     }
                 });
 
-                int frames12 = 0;
-                var seenBattery = new HashSet<string>();
                 while (DateTime.Now < stop)
                 {
                     var buf = new byte[inLen];
                     var ov = new System.Threading.NativeOverlapped { EventHandle = ev };
                     bool ok = ReadFile(h, buf, (uint)inLen, out _, ref ov);
                     if (!ok && Marshal.GetLastWin32Error() != 997) break;
-                    if (WaitForSingleObject(ev, 600) != 0) { CancelIoEx(h, IntPtr.Zero); WaitForSingleObject(ev, 150); continue; }
-                    if (!GetOverlappedResult(h, ref ov, out var n, true) || n < 37) continue;
-
-                    if (buf[0] == 0x12)
+                    if (WaitForSingleObject(ev, 700) != 0) { CancelIoEx(h, IntPtr.Zero); WaitForSingleObject(ev, 150); continue; }
+                    if (!GetOverlappedResult(h, ref ov, out var n, true) || n < 3) continue;
+                    total++;
+                    string sig = buf[0] + ":" + Convert.ToHexString(buf, 0, (int)Math.Min(n, 20));
+                    if (seen.Add(sig) || buf[0] == 0x03)
                     {
-                        frames12++;
-                        int charge = buf[35], batt = buf[36];
-                        string sig = $"{charge}/{batt}";
-                        if (seenBattery.Add(sig))
-                        {
-                            Console.WriteLine($"[PID_{pid}] 0x12帧#{frames12}: 充电状态={charge} 电量={batt}%   全帧: {Convert.ToHexString(buf, 0, (int)Math.Min(n, 48)).ToLowerInvariant()}");
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine($"[PID_{pid}] 帧0x{buf[0]:X2} {n}B: {Convert.ToHexString(buf, 0, (int)Math.Min(n, 42)).ToLowerInvariant()}");
+                        Console.WriteLine($"  [{buf[0]:X2}] {n}B: {Convert.ToHexString(buf, 0, (int)Math.Min(n, 40)).ToLowerInvariant()}");
                     }
                 }
-                hb.Wait();
-                Console.WriteLine($"[PID_{pid}] 共收到 0x12 帧: {frames12}, 电量读数: {(seenBattery.Count == 0 ? "无" : string.Join(", ", seenBattery))}");
+                Console.WriteLine($"  共{total}帧, 独立签名{seen.Count}种");
             }
             finally { CloseHandle(ev); }
         }

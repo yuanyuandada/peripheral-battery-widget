@@ -1,4 +1,6 @@
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace PeripheralBatteryWidget;
 
@@ -40,19 +42,79 @@ internal static class GameSirHid
     private const int HIDP_SUCCESS = 0x00110000;
     private static readonly Guid HidGuid = new(0x4d1e55b2, 0xf16f, 0x11cf, 0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30);
 
+    [DllImport("Cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Locate_DevNodeW(out uint devInst, string deviceId, uint flags);
+    [DllImport("Cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Get_Parent(out uint parent, uint devInst, uint flags);
+    [DllImport("Cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Get_Device_IDW(uint devInst, StringBuilder id, int len, uint flags);
+
     public static List<DeviceInfo> Collect()
     {
         var result = new List<DeviceInfo>();
         try
         {
-            foreach (var path in GetHidPaths())
+            var paths = GetHidPaths();
+            foreach (var path in paths)
             {
                 if (path.IndexOf("vid_3537", StringComparison.OrdinalIgnoreCase) < 0) continue;
                 try { CollectOne(path, result); } catch { }
             }
+            // 蓝牙模式的手柄（伪装成 Xbox 手柄 PID_02E0）：无电量查询通道，但要让设备可见并写明原因
+            foreach (var path in paths)
+            {
+                if (path.IndexOf("pid_02e0", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                try { CollectBtPad(path, result); } catch { }
+            }
         }
         catch { }
         return result;
+    }
+
+    // 蓝牙手柄：接口路径反查设备树 → 父节点(蓝牙设备) → MAC
+    private static void CollectBtPad(string path, List<DeviceInfo> result)
+    {
+        var h = CreateFileW(path, GENERIC_READ, SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+        if (h.IsInvalid) return;
+        string mac;
+        using (h)
+        {
+            if (!HidD_GetPreparsedData(h, out var pp)) return;
+            try
+            {
+                var caps = new HidpCaps();
+                if (HidP_GetCaps(pp, ref caps) != HIDP_SUCCESS) return;
+                // GameSir 蓝牙模式特征：游戏控制页(0x0005) 且无输出通道（真 Xbox 手柄是页1、有64B输出）
+                if (caps.UsagePage != 0x0005 || caps.OutputReportByteLength != 0) return;
+            }
+            finally { HidD_FreePreparsedData(pp); }
+
+            // \\?\HID#实例ID#{GUID} → 实例ID（#还原为\）→ 定位设备节点 → 父节点 → 设备ID含蓝牙MAC
+            int guidIdx = path.IndexOf("#{", StringComparison.Ordinal);
+            string instId = path.Length > 4 && guidIdx > 4 ? path[4..guidIdx].Replace('#', '\\') : "";
+            mac = "";
+            if (instId.Length > 0 && CM_Locate_DevNodeW(out var devInst, instId, 0) == 0 && CM_Get_Parent(out var parent, devInst, 0) == 0)
+            {
+                var sb = new StringBuilder(512);
+                if (CM_Get_Device_IDW(parent, sb, sb.Capacity, 0) == 0)
+                {
+                    var m = Regex.Match(sb.ToString(), @"DEV_([0-9A-Fa-f]{12})");
+                    if (m.Success) mac = m.Groups[1].Value.ToUpperInvariant();
+                }
+            }
+            if (mac.Length == 0) mac = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(path)))[..12];
+        }
+        var key = "gsbt:" + mac;
+        if (result.Any(r => r.Key == key)) return;
+        result.Add(new DeviceInfo
+        {
+            Key = key,
+            RawName = "手柄 (蓝牙)",
+            Transport = "蓝牙",
+            Percent = null,
+            FourLevel = false,
+            Error = "蓝牙模式不开放电量查询（线连或2.4G接收器可显示精确电量）",
+        });
     }
 
     private static string[] GetHidPaths()
