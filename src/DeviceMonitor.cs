@@ -50,11 +50,18 @@ public sealed class DeviceMonitor : IDisposable
     private static async Task<List<DeviceInfo>> CollectAsync()
     {
         var bleTask = CollectBleAsync();
+        var gsTask = Task.Run(CollectGameSir);
         var xi = CollectXInput();
         var ble = await bleTask;
-        var list = new List<DeviceInfo>(ble.Count + xi.Count);
+        var gs = await gsTask;
+        var list = new List<DeviceInfo>(ble.Count + xi.Count + gs.Count);
         list.AddRange(ble);
+        // 盖世小鸡 T4N2 通道识别到手柄后，压掉 XInput 的"有线桥"行
+        // （那是同一手柄的接收器/有线身份，永远没有电量数据）
+        if (gs.Count > 0)
+            xi.RemoveAll(d => d.Percent == null);
         list.AddRange(xi);
+        list.AddRange(gs);
         return list;
     }
 
@@ -162,6 +169,9 @@ public sealed class DeviceMonitor : IDisposable
         }
         return list;
     }
+
+    // ---------- 通道3: 盖世小鸡 T4N2（Nova 2 Lite 等）精确电量 ----------
+    private static List<DeviceInfo> CollectGameSir() => GameSirHid.Collect();
 
     public void Dispose() => _timer.Dispose();
 }
